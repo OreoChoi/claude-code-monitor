@@ -19,7 +19,7 @@
     "sse",
     "cli"
   ],
-  "author": "ChoiJunHo",
+  "author": "OreoChoi",
   "license": "MIT",
   "engines": {
     "node": ">=18"
@@ -33,6 +33,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ChoiJunHo-GreenRibbon/claude-code-monitor.git"
-  }
+    "url": "git+https://github.com/OreoChoi/claude-code-monitor.git"
+  },
+  "bugs": {
+    "url": "https://github.com/OreoChoi/claude-code-monitor/issues"
+  },
+  "homepage": "https://github.com/OreoChoi/claude-code-monitor#readme"
 }
