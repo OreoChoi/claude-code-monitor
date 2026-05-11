@@ -1,0 +1,38 @@
+{
+  "name": "claude-code-monitor",
+  "version": "0.1.0",
+  "description": "A tiny local web UI that streams your active Claude Code CLI session in real time. Zero dependencies.",
+  "type": "module",
+  "main": "monitor.mjs",
+  "bin": {
+    "claude-code-monitor": "./monitor.mjs"
+  },
+  "scripts": {
+    "start": "node monitor.mjs"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "anthropic",
+    "monitor",
+    "observability",
+    "sse",
+    "cli"
+  ],
+  "author": "ChoiJunHo",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "monitor.mjs",
+    "start.command",
+    "stop.command",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ChoiJunHo-GreenRibbon/claude-code-monitor.git"
+  }
+}
