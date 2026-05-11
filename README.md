@@ -1,5 +1,7 @@
 # claude-code-monitor
 
+**English** | [한국어](./README.ko.md)
+
 A tiny, local-only web UI that streams your active **Claude Code** CLI session in real time.
 
 It tails the JSONL session files Claude Code already writes to
