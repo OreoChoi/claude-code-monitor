@@ -4,4 +4,5 @@ node_modules/
 /tmp/
 .idea/
 .vscode/
-.claude/
+.claude/*
+!.claude/skills/

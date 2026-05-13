@@ -8,7 +8,11 @@
     "claude-code-monitor": "./monitor.mjs"
   },
   "scripts": {
-    "start": "node monitor.mjs"
+    "start": "node monitor.mjs",
+    "screenshot": "node scripts/screenshot.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.60.0"
   },
   "keywords": [
     "claude",

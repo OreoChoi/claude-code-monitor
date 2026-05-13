@@ -8,7 +8,7 @@ import http from 'node:http';
 import os from 'node:os';
 
 const PORT = 7777;
-const ROOT = path.join(os.homedir(), '.claude', 'projects');
+const ROOT = process.env.CC_MONITOR_PROJECTS_DIR || path.join(os.homedir(), '.claude', 'projects');
 
 if (!fs.existsSync(ROOT)) {
   console.error(`Not found: ${ROOT}`);
@@ -535,6 +535,21 @@ const HTML = String.raw`<!doctype html>
   .card.collapsible .detail { display: none; margin-top: var(--space-2); border-top: 1px dashed var(--color-border-subtle); padding-top: var(--space-2); }
   .card.collapsible.open .detail { display: block; }
   .card.collapsible .header-row { display: flex; align-items: center; flex: 1; min-width: 0; }
+
+  .askq { display: flex; flex-direction: column; gap: var(--space-4); padding: var(--space-1) 0; }
+  .askq-q { display: flex; flex-direction: column; gap: var(--space-2); }
+  .askq-q + .askq-q { border-top: 1px dashed var(--color-border-subtle); padding-top: var(--space-4); }
+  .askq-q-head { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
+  .askq-idx { font-family: var(--font-mono); font-size: 11px; color: var(--color-text-tertiary); letter-spacing: 0.04em; }
+  .askq-chip { display: inline-block; padding: 1px 8px; border-radius: 999px; background: var(--color-surface-2); color: var(--color-text-secondary); font-size: 11px; font-weight: var(--font-weight-semibold); text-transform: uppercase; letter-spacing: 0.05em; }
+  .askq-mode { font-size: 11px; color: var(--color-text-tertiary); }
+  .askq-title { font-size: var(--font-size-md); color: var(--color-text); font-weight: var(--font-weight-semibold); line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
+  .askq-opts { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+  .askq-opt { border: 1px solid var(--color-border-subtle); border-radius: var(--radius-sm); padding: var(--space-2) var(--space-3); background: var(--color-surface-1); }
+  .askq-opt--rec { border-color: var(--accent-purple); }
+  .askq-opt-label { display: flex; align-items: center; gap: var(--space-2); color: var(--color-text); font-weight: var(--font-weight-semibold); font-size: 13px; }
+  .askq-opt-desc { color: var(--color-text-secondary); font-size: 12.5px; line-height: 1.5; margin-top: 4px; white-space: pre-wrap; word-break: break-word; }
+  .askq-rec { font-size: 10px; padding: 1px 6px; border-radius: 999px; background: var(--accent-purple); color: #fff; letter-spacing: 0.04em; font-weight: var(--font-weight-semibold); text-transform: uppercase; }
   h3 { margin: var(--space-5) 0 var(--space-3); padding-top: var(--space-4); border-top: 1px solid var(--color-border); font-size: var(--font-size-md); color: var(--color-text); font-weight: var(--font-weight-semibold); letter-spacing: var(--letter-spacing-tight); }
   h3:first-child { margin-top: 0; padding-top: 0; border-top: none; }
   .stat { display: flex; justify-content: space-between; gap: var(--space-2); padding: var(--space-1) 0; font-size: var(--font-size-sm); border-bottom: 1px dashed var(--color-border-subtle); }
@@ -1314,8 +1329,14 @@ function addCollapsibleCard(tab, cls, tag, summary, detail, ts, data) {
     if (data.parentSkillId) div.dataset.parentSkillId = data.parentSkillId;
   }
   const limit = 8000;
-  const text = String(detail ?? '');
-  const moreNote = text.length > limit ? '<div class="truncated">… ' + (text.length - limit).toLocaleString() + ' more chars</div>' : '';
+  let detailInner;
+  if (data && data.detailHtml) {
+    detailInner = data.detailHtml;
+  } else {
+    const text = String(detail ?? '');
+    const moreNote = text.length > limit ? '<div class="truncated">… ' + (text.length - limit).toLocaleString() + ' more chars</div>' : '';
+    detailInner = '<pre>' + esc(text.slice(0, limit)) + '</pre>' + moreNote;
+  }
   div.innerHTML =
     '<div class="name">' +
       '<div class="header-row">' +
@@ -1325,8 +1346,42 @@ function addCollapsibleCard(tab, cls, tag, summary, detail, ts, data) {
       '</div>' +
       '<span class="time">' + esc(time(ts)) + '</span>' +
     '</div>' +
-    '<div class="detail"><pre>' + esc(text.slice(0, limit)) + '</pre>' + moreNote + '</div>';
+    '<div class="detail">' + detailInner + '</div>';
   appendCard(tab, div);
+}
+
+function renderAskUserQuestionDetail(input) {
+  const questions = (input && Array.isArray(input.questions)) ? input.questions : [];
+  if (questions.length === 0) return '<pre>' + esc(JSON.stringify(input, null, 2)) + '</pre>';
+  const parts = ['<div class="askq">'];
+  questions.forEach((q, i) => {
+    parts.push('<div class="askq-q">');
+    parts.push('<div class="askq-q-head">');
+    parts.push('<span class="askq-idx">Q' + (i + 1) + '</span>');
+    if (q.header) parts.push('<span class="askq-chip">' + esc(q.header) + '</span>');
+    parts.push('<span class="askq-mode">' + (q.multiSelect ? '다중 선택' : '단일 선택') + '</span>');
+    parts.push('</div>');
+    parts.push('<div class="askq-title">' + esc(q.question || '') + '</div>');
+    const opts = Array.isArray(q.options) ? q.options : [];
+    if (opts.length) {
+      parts.push('<ul class="askq-opts">');
+      opts.forEach((o) => {
+        const label = String(o.label || '');
+        const isRec = /\(Recommended\)\s*$/i.test(label) || /\(추천\)\s*$/i.test(label);
+        const cleanLabel = isRec ? label.replace(/\s*\((Recommended|추천)\)\s*$/i, '') : label;
+        parts.push('<li class="askq-opt' + (isRec ? ' askq-opt--rec' : '') + '">');
+        parts.push('<div class="askq-opt-label">' + esc(cleanLabel));
+        if (isRec) parts.push('<span class="askq-rec">추천</span>');
+        parts.push('</div>');
+        if (o.description) parts.push('<div class="askq-opt-desc">' + esc(o.description) + '</div>');
+        parts.push('</li>');
+      });
+      parts.push('</ul>');
+    }
+    parts.push('</div>');
+  });
+  parts.push('</div>');
+  return parts.join('');
 }
 
 function addSkillResultCard(tab, skillName, body, ts) {
@@ -1856,6 +1911,9 @@ function renderEvent(tab, j) {
         const summary = summarize(c.name, c.input);
         const detail = typeof c.input === 'string' ? c.input : JSON.stringify(c.input, null, 2);
         const cardData = { sidechain: !!j.isSidechain, toolUseId: c.id || null };
+        if (c.name === 'AskUserQuestion' && c.input && typeof c.input === 'object') {
+          cardData.detailHtml = renderAskUserQuestionDetail(c.input);
+        }
         addCollapsibleCard(tab, 'tool tool-' + c.name, c.name, summary, detail, ts, cardData);
         if (c.name === 'Skill' && c.id) {
           tab.skillToolUseIds.add(c.id);
