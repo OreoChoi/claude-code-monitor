@@ -2,12 +2,11 @@
 
 [English](./README.md) | **한국어**
 
-> Claude Code CLI 세션을 브라우저로 실시간 관찰하는 로컬 단일파일 도구.
-> JSONL 세션 파일을 그저 tail할 뿐, CLI를 감싸지도 네트워크로 보내지도 않습니다.
+> **Claude Code** 로컬 웹 도구. 외부에서 띄운 세션은 JSONL tail로 **관찰**, 모니터에서 직접 띄운 세션은 브라우저 안 터미널로 **조작**까지. 전부 `localhost`에서만 동작.
 
 ![hero](./docs/screenshots/hero.png)
 
-![status](https://img.shields.io/badge/status-experimental-orange) ![license](https://img.shields.io/badge/license-MIT-blue) ![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen) ![deps](https://img.shields.io/badge/runtime%20deps-0-success)
+![status](https://img.shields.io/badge/status-experimental-orange) ![license](https://img.shields.io/badge/license-MIT-blue) ![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)
 
 ---
 

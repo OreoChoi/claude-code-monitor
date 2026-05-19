@@ -6,6 +6,23 @@ import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
 import os from 'node:os';
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { WebSocketServer } from 'ws';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+const execFileP = promisify(execFile);
+// node-pty is loaded on first PTY spawn so observation-only deployments
+// (or environments lacking a native build) keep working.
+let nodePtyPromise = null;
+async function getNodePty() {
+  if (!nodePtyPromise) {
+    nodePtyPromise = import('node-pty').then((m) => m.default || m);
+  }
+  return nodePtyPromise;
+}
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const PORT = 7777;
 const ROOT = process.env.CC_MONITOR_PROJECTS_DIR || path.join(os.homedir(), '.claude', 'projects');
@@ -50,8 +67,13 @@ function fileExists(p) { try { fs.accessSync(p); return true; } catch { return f
 
 function cwdFromJsonl(jsonlPath) {
   try {
-    const head = fs.readFileSync(jsonlPath, 'utf-8').split('\n').slice(0, 5);
-    for (const ln of head) {
+    const lines = fs.readFileSync(jsonlPath, 'utf-8').split('\n');
+    // Scan up to first 500 lines — metadata-only events at the head may push
+    // the first message-bearing event (with `cwd`) past line 5.
+    const max = Math.min(lines.length, 500);
+    for (let i = 0; i < max; i++) {
+      const ln = lines[i];
+      if (!ln) continue;
       try { const j = JSON.parse(ln); if (j.cwd) return j.cwd; } catch {}
     }
   } catch {}
@@ -200,6 +222,7 @@ poll();
 
 const HTML = String.raw`<!doctype html>
 <html><head><meta charset="utf-8"><title>Claude Monitor</title>
+<link rel="stylesheet" href="/assets/xterm.css">
 <script>try{document.documentElement.classList.toggle('light',localStorage.getItem('cm-theme')==='light');if(localStorage.getItem('cm-side-open')==='false')document.documentElement.classList.add('side-closed')}catch{}</script>
 <style>
   * { box-sizing: border-box; }
@@ -442,6 +465,82 @@ const HTML = String.raw`<!doctype html>
   header .dot { width: 7px; height: 7px; border-radius: var(--radius-full); background: var(--color-success); box-shadow: 0 0 0 3px var(--color-success-subtle); animation: pulse 1.6s infinite var(--ease-out); }
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
   #mainContainer { overflow: hidden; grid-column: 2; background: var(--color-bg); }
+
+  /* PTY shell pane — appears above the card stream inside a tab pane when attached.
+     Override the default .tab-pane (display:none) / .tab-pane.active (display:block). */
+  .tab-pane.active { display: flex; flex-direction: column; padding: 0; overflow: hidden; height: 100%; min-height: 0; }
+  .tab-pane.active.has-pty .turns-host { flex: 1 1 0%; min-height: 0; overflow-y: auto; padding: var(--space-4) var(--space-5); }
+  .tab-pane.active.has-pty .pty-host { flex: 0 0 var(--pty-h, 260px); min-height: 200px; display: flex; flex-direction: column; border-top: 1px solid var(--color-border-subtle); }
+  .tab-pane.active:not(.has-pty) .pty-host { display: none; }
+  .tab-pane.active:not(.has-pty) .turns-host { flex: 1 1 100%; min-height: 0; overflow-y: auto; padding: var(--space-4) var(--space-5); }
+  .pty-bar { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-1) var(--space-3); background: var(--color-surface-1); border-bottom: 1px solid var(--color-border-subtle); font-size: 11px; color: var(--color-text-secondary); }
+  .pty-bar .pty-status { color: var(--accent-purple); font-weight: var(--font-weight-semibold); }
+  .pty-bar .pty-status.exited { color: var(--color-danger); }
+  .pty-bar .pty-cwd { font-family: var(--font-mono); color: var(--color-text-tertiary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
+  .pty-bar button { background: transparent; border: 1px solid var(--color-border-subtle); color: var(--color-text-secondary); padding: 2px 8px; border-radius: var(--radius-sm); font-size: 11px; cursor: pointer; }
+  .pty-bar button:hover { color: var(--color-text); border-color: var(--color-border); }
+  .pty-bar button[data-act="respawn"] { background: var(--accent-purple); color: #fff; border-color: var(--accent-purple); }
+  .pty-bar button[data-act="respawn"]:hover { filter: brightness(1.1); }
+  .pty-bar { cursor: pointer; user-select: none; }
+  .pty-bar .pty-status, .pty-bar .pty-cwd { pointer-events: none; }
+  .pty-bar button { pointer-events: auto; }
+  .pty-resizer { flex: 0 0 5px; background: var(--color-border-subtle); cursor: row-resize; transition: background 100ms ease-out; }
+  .pty-resizer:hover, .pty-resizer.dragging { background: var(--accent-purple); }
+  .tab-pane.active:not(.has-pty) .pty-resizer { display: none; }
+  .tab-pane.active.pty-fullscreen .turns-host,
+  .tab-pane.active.pty-fullscreen .attach-bar,
+  .tab-pane.active.pty-fullscreen .pty-resizer { display: none; }
+  .tab-pane.active.pty-fullscreen .pty-host { flex: 1 1 100%; }
+
+  .attach-bar { display: flex; justify-content: flex-end; padding: var(--space-2) var(--space-4); border-top: 1px solid var(--color-border-subtle); background: var(--color-surface-1); }
+  .attach-bar button { background: var(--accent-purple); color: #fff; border: none; padding: 6px 14px; border-radius: var(--radius-sm); font-size: 12px; cursor: pointer; font-weight: var(--font-weight-semibold); }
+  .attach-bar button:hover { filter: brightness(1.1); }
+
+  /* Resume-cost summary inside the confirm modal */
+  .resume-cost { display: flex; flex-direction: column; gap: var(--space-3); }
+  .resume-cost .intro { color: var(--color-text); font-size: 13.5px; line-height: 1.5; }
+  .resume-cost .section-label { font-size: 11px; color: var(--color-text-tertiary); text-transform: uppercase; letter-spacing: 0.08em; font-weight: var(--font-weight-semibold); margin-top: var(--space-2); }
+  .resume-cost .stats { display: grid; grid-template-columns: max-content 1fr; gap: 4px var(--space-3); padding: var(--space-3); background: var(--color-surface-1); border: 1px solid var(--color-border-subtle); border-radius: var(--radius-sm); }
+  .resume-cost .stats .k { color: var(--color-text-secondary); font-size: 12.5px; font-family: var(--font-mono); }
+  .resume-cost .stats .v { color: var(--color-text); font-size: 13px; font-family: var(--font-mono); text-align: right; }
+  .resume-cost .stats .row-note { grid-column: 1 / -1; color: var(--color-text-tertiary); font-size: 11.5px; padding-top: 2px; border-top: 1px dashed var(--color-border-subtle); margin-top: 4px; }
+  .resume-cost .stats .v.muted { color: var(--color-text-tertiary); }
+  .resume-cost .estimate { display: flex; align-items: baseline; gap: var(--space-2); padding: var(--space-3); background: rgba(167, 139, 250, 0.08); border: 1px solid var(--accent-purple); border-radius: var(--radius-sm); }
+  .resume-cost .estimate .num { font-family: var(--font-mono); font-size: 18px; font-weight: var(--font-weight-semibold); color: var(--accent-purple); }
+  .resume-cost .estimate .label { color: var(--color-text-secondary); font-size: 12px; }
+  .resume-cost .note { font-size: 12px; color: var(--color-text-tertiary); line-height: 1.55; }
+
+  /* Token row pulse on update */
+  .token-row { position: relative; transition: background var(--duration-base) var(--ease-out); }
+  .token-row .token-val { transition: color var(--duration-base) var(--ease-out); }
+  .token-row.token-bump { animation: tokenBump 800ms ease-out; }
+  @keyframes tokenBump {
+    0%   { background: transparent; }
+    15%  { background: rgba(167, 139, 250, 0.22); }
+    100% { background: transparent; }
+  }
+  .token-row.token-bump .token-val { color: var(--accent-purple); }
+  .token-help { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; margin-left: 6px; border: 1px solid var(--color-border); border-radius: 50%; color: var(--color-text-tertiary); font-size: 9px; font-weight: var(--font-weight-semibold); cursor: help; vertical-align: middle; line-height: 1; transition: color var(--duration-fast) var(--ease-out), border-color var(--duration-fast) var(--ease-out); }
+  .token-help:hover { color: var(--accent-purple); border-color: var(--accent-purple); }
+  #floatingTip { position: fixed; max-width: 280px; padding: 8px 10px; background: var(--color-surface-2); color: var(--color-text); border: 1px solid var(--color-border); border-radius: var(--radius-sm); box-shadow: var(--shadow-lg); font-size: 12px; line-height: 1.5; z-index: 9999; opacity: 0; pointer-events: none; transition: opacity 100ms ease-out; }
+  #floatingTip.open { opacity: 1; }
+  .attach-bar .attach-bar-note { flex: 1; font-size: 11px; color: var(--color-text-tertiary); align-self: center; padding-right: var(--space-3); }
+  .tab-pane.active.has-pty .attach-bar { display: none; }
+  .pty-term { flex: 1 1 auto; min-height: 160px; padding: var(--space-1) var(--space-2); background: #0c0d0f; overflow: hidden; position: relative; }
+  .pty-term .xterm, .pty-term .xterm-viewport, .pty-term .xterm-screen { background: #0c0d0f !important; height: 100% !important; }
+
+  /* Spawn modal */
+  #spawnModal { display: none; }
+  #spawnModal.open { display: flex; }
+  .modal-body label { display: block; font-size: 12px; color: var(--color-text-secondary); margin: var(--space-2) 0 4px; }
+  .modal-body input[type="text"] { width: 100%; padding: 8px 10px; border: 1px solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-1); color: var(--color-text); font-family: var(--font-mono); font-size: 13px; }
+  .modal-body .hint { font-size: 11px; color: var(--color-text-tertiary); margin-top: 4px; }
+  .modal-body .recent-cwds { display: flex; flex-direction: column; gap: 4px; margin-top: var(--space-2); max-height: 200px; overflow-y: auto; }
+  .modal-body .recent-cwds button { text-align: left; padding: 6px 8px; background: var(--color-surface-1); border: 1px solid var(--color-border-subtle); border-radius: var(--radius-sm); color: var(--color-text-secondary); cursor: pointer; font-family: var(--font-mono); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .modal-body .recent-cwds button:hover { color: var(--color-text); border-color: var(--color-border); }
+
+  /* Tab indicator for PTY-attached sessions */
+  .tab .tab-pty-mark { color: var(--accent-purple); margin-right: 4px; }
   #side { padding: 0; border-right: 1px solid var(--color-border-subtle); background: var(--color-surface-1); grid-column: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; position: relative; }
   #sideInfo { overflow-y: auto; padding: var(--space-5) var(--space-4); flex: 1; min-height: 0; }
   #info .stat span:last-child { white-space: normal; word-break: break-all; overflow: visible; text-overflow: clip; }
@@ -713,6 +812,7 @@ const HTML = String.raw`<!doctype html>
     <button id="clearBtn" class="btn btn--ghost" data-i18n="clear">Clear</button>
   </div>
   <div class="toolbar__group">
+    <button id="spawnBtn" class="btn btn--primary" title="Spawn a new claude session in a terminal" data-i18n="spawn_btn">+ Spawn</button>
     <button id="sessionsBtn" class="btn btn--secondary" data-i18n="sessions_btn">Sessions</button>
     <button id="settingsBtn" class="btn btn--ghost btn--icon" title="Settings / 설정" aria-label="Settings"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg></button>
   </div>
@@ -721,6 +821,8 @@ const HTML = String.raw`<!doctype html>
 <div id="side">
   <div id="tabs" data-empty="—"></div>
   <div id="sideInfo">
+    <h3 data-i18n="tokens_title">Tokens (this session)</h3>
+    <div id="tokens"></div>
     <h3 data-i18n="session_title">Session</h3>
     <div id="info"><div class="stat"><span>—</span><span></span></div></div>
     <h3 data-i18n="context_title">My context</h3>
@@ -730,8 +832,6 @@ const HTML = String.raw`<!doctype html>
     <h3 data-i18n="tools_title">Tool calls (click to filter)</h3>
     <div id="tools"></div>
     <div id="pinHint"></div>
-    <h3 data-i18n="tokens_title">Tokens (this session)</h3>
-    <div id="tokens"></div>
   </div>
   <div class="col-resizer" data-resize="side" title="드래그하여 너비 조절"></div>
 </div>
@@ -796,6 +896,39 @@ const HTML = String.raw`<!doctype html>
     </div>
   </div>
 </div>
+<div id="confirmBackdrop" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+  <div class="modal">
+    <div class="modal__header">
+      <span id="confirmTitle" class="modal__title">확인</span>
+      <button id="confirmClose" class="modal__close" title="Close" aria-label="Close">×</button>
+    </div>
+    <div class="modal__body modal-body">
+      <div id="confirmBody"></div>
+      <div class="form-row" style="margin-top: var(--space-4); display:flex; justify-content:flex-end; gap: var(--space-2);">
+        <button id="confirmCancel" class="btn btn--ghost">취소</button>
+        <button id="confirmOk" class="btn btn--primary">진행</button>
+      </div>
+    </div>
+  </div>
+</div>
+<div id="spawnBackdrop" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="spawnTitle">
+  <div class="modal">
+    <div class="modal__header">
+      <span id="spawnTitle" class="modal__title" data-i18n="spawn_title">Spawn Claude session</span>
+      <button id="spawnClose" class="modal__close" title="Close" aria-label="Close">×</button>
+    </div>
+    <div class="modal__body modal-body">
+      <label for="spawnCwd" data-i18n="spawn_cwd_label">Working directory</label>
+      <input id="spawnCwd" type="text" placeholder="/path/to/project" autocomplete="off" spellcheck="false" />
+      <div class="hint" data-i18n="spawn_cwd_hint">Claude will be spawned with this as its cwd. Recent paths below.</div>
+      <div id="spawnRecent" class="recent-cwds"></div>
+      <div class="form-row" style="margin-top: var(--space-3); display:flex; justify-content:flex-end; gap: var(--space-2);">
+        <button id="spawnCancel" class="btn btn--ghost" data-i18n="cancel">Cancel</button>
+        <button id="spawnConfirm" class="btn btn--primary" data-i18n="spawn_btn">+ Spawn</button>
+      </div>
+    </div>
+  </div>
+</div>
 <script>
 const i18n = {
   en: {
@@ -821,6 +954,10 @@ const i18n = {
     theme_dark: 'Dark', theme_light: 'Light',
     sessions_btn: 'Sessions', sessions_title: 'Session browser', sessions_empty: 'No sessions found',
     sessions_loading: 'Loading…', sessions_failed: 'Failed to load',
+    spawn_btn: '+ Spawn', spawn_title: 'Spawn Claude session',
+    spawn_cwd_label: 'Working directory',
+    spawn_cwd_hint: 'Claude will be spawned with this as its cwd. Recent paths below.',
+    cancel: 'Cancel',
     date_today: 'Today', date_yesterday: 'Yesterday', date_thisweek: 'This week', date_older: 'Older',
     window_30m: '30 min', window_2h: '2 hours', window_6h: '6 hours', window_24h: '24 hours',
     drawer_search_ph: 'Search project or ID…',
@@ -858,6 +995,10 @@ const i18n = {
     theme_dark: '다크', theme_light: '라이트',
     sessions_btn: '세션', sessions_title: '세션 브라우저', sessions_empty: '세션 없음',
     sessions_loading: '불러오는 중…', sessions_failed: '불러오기 실패',
+    spawn_btn: '+ 새 세션', spawn_title: 'Claude 세션 시작',
+    spawn_cwd_label: '작업 디렉터리',
+    spawn_cwd_hint: '여기를 cwd로 해서 claude를 띄웁니다. 아래는 최근 사용 경로.',
+    cancel: '취소',
     date_today: '오늘', date_yesterday: '어제', date_thisweek: '이번 주', date_older: '이전',
     window_30m: '30분', window_2h: '2시간', window_6h: '6시간', window_24h: '24시간',
     drawer_search_ph: '프로젝트명 / ID 검색…',
@@ -892,6 +1033,81 @@ function applyStaticI18n() {
 const mainContainer = document.getElementById('mainContainer');
 const info = document.getElementById('info');
 const tokensEl = document.getElementById('tokens');
+const TOKEN_KEYS = ['input', 'output', 'cache_read', 'cache_create'];
+
+// Floating tooltip — sidebar parents have overflow:hidden so an inline ::after
+// gets clipped. Render once to body, position on hover.
+const floatingTip = document.createElement('div');
+floatingTip.id = 'floatingTip';
+document.body.appendChild(floatingTip);
+document.body.addEventListener('mouseover', (e) => {
+  const t = e.target.closest('[data-tip]');
+  if (!t) return;
+  floatingTip.textContent = t.getAttribute('data-tip') || '';
+  const r = t.getBoundingClientRect();
+  floatingTip.classList.add('open');
+  // Position above the trigger; fall back below if it would clip the viewport top
+  const tipRect = floatingTip.getBoundingClientRect();
+  const left = Math.max(8, Math.min(window.innerWidth - tipRect.width - 8, r.left + r.width / 2 - tipRect.width / 2));
+  let top = r.top - tipRect.height - 8;
+  if (top < 8) top = r.bottom + 8;
+  floatingTip.style.left = left + 'px';
+  floatingTip.style.top  = top  + 'px';
+});
+document.body.addEventListener('mouseout', (e) => {
+  const t = e.target.closest('[data-tip]');
+  if (!t) return;
+  if (e.relatedTarget && t.contains(e.relatedTarget)) return;
+  floatingTip.classList.remove('open');
+});
+const TOKEN_TIPS = {
+  input: '이번 세션에서 모델로 보낸 새 입력 토큰의 누적. 캐시 적용 안 된 분량.',
+  output: '모델이 생성한 토큰의 누적. 일반적으로 가장 비싼 항목.',
+  cache_read: '이미 캐시된 prompt prefix를 재사용해서 읽은 토큰 누적. 정상 input의 약 1/10 가격으로 저렴. 단, claude --resume으로 새 프로세스를 띄우면 옛 캐시는 못 씀.',
+  cache_create: '캐시에 새로 저장된 토큰 누적. 정상 input보다 약간 비싸지만 다음 턴부터 cache_read로 재사용돼 비용이 절감됨. resume 시 첫 메시지 비용 ≈ 이 값.',
+};
+
+function renderTokens(tab, opts) {
+  opts = opts || {};
+  if (!tab) { tokensEl.innerHTML = ''; return; }
+  const existing = tokensEl.querySelectorAll('.token-row');
+  if (existing.length !== TOKEN_KEYS.length) {
+    tokensEl.innerHTML = TOKEN_KEYS.map((k) =>
+      '<div class="stat token-row" data-key="' + k + '">' +
+        '<span>' + k + '<span class="token-help" data-tip="' + esc(TOKEN_TIPS[k] || '') + '" aria-label="설명">?</span></span>' +
+        '<span class="token-val">' + (tab.tokens[k] || 0).toLocaleString() + '</span>' +
+      '</div>'
+    ).join('');
+    return;
+  }
+  existing.forEach((row) => {
+    const k = row.dataset.key;
+    const valEl = row.querySelector('.token-val');
+    const newVal = tab.tokens[k] || 0;
+    const oldVal = parseInt(valEl.textContent.replace(/[^\d-]/g, ''), 10) || 0;
+    if (newVal === oldVal) return;
+    if (opts.animate === false) {
+      valEl.textContent = newVal.toLocaleString();
+    } else {
+      animateTokenCount(valEl, oldVal, newVal);
+      row.classList.remove('token-bump');
+      void row.offsetWidth; // restart animation
+      row.classList.add('token-bump');
+    }
+  });
+}
+
+function animateTokenCount(el, from, to) {
+  const dur = 500;
+  const start = performance.now();
+  function step(now) {
+    const t = Math.min(1, (now - start) / dur);
+    const eased = 1 - Math.pow(1 - t, 3);
+    el.textContent = Math.round(from + (to - from) * eased).toLocaleString();
+    if (t < 1) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
 const toolsEl = document.getElementById('tools');
 const sessEl = document.getElementById('sess');
 const connEl = document.getElementById('conn');
@@ -986,6 +1202,34 @@ function ensureTab(sessionId, project, path, cwd) {
   const pane = document.createElement('div');
   pane.className = 'tab-pane';
   pane.dataset.session = sessionId;
+  const ptyHost = document.createElement('div');
+  ptyHost.className = 'pty-host';
+  const turnsHost = document.createElement('div');
+  turnsHost.className = 'turns-host';
+  const attachBar = document.createElement('div');
+  attachBar.className = 'attach-bar';
+  attachBar.innerHTML = '<span class="attach-bar-note">이 세션 이어서 새 터미널 (--resume)</span><button data-act="attach">+ 터미널 열기</button>';
+  const ptyResizer = document.createElement('div');
+  ptyResizer.className = 'pty-resizer';
+  ptyResizer.title = '드래그로 높이 조정';
+  pane.appendChild(turnsHost);
+  pane.appendChild(attachBar);
+  pane.appendChild(ptyResizer);
+  pane.appendChild(ptyHost);
+  wirePtyResizer(pane, ptyHost, ptyResizer, sessionId);
+  const _sid = sessionId;
+  const _cwdParam = cwd;
+  attachBar.querySelector('[data-act="attach"]').addEventListener('click', () => {
+    const t = tabs.get(_sid);
+    if (!t) return;
+    const targetCwd = t.cwd || (t.inventory && t.inventory.cwd) || _cwdParam || '';
+    if (!targetCwd) {
+      // cwd unknown — open the spawn modal so the user can fill it in.
+      setSpawnModal(true);
+      return;
+    }
+    spawnAndAttachInline(t, targetCwd);
+  });
   mainContainer.appendChild(pane);
 
   const projName = projectDisplayName(project, cwd);
@@ -1021,6 +1265,9 @@ function ensureTab(sessionId, project, path, cwd) {
   const tab = {
     sessionId, project, path,
     mainEl: pane, tabEl,
+    ptyHost, turnsHost,
+    ptyId: null, term: null, fit: null, ws: null,
+    cwd: cwd || '',
     tokens: { input: 0, output: 0, cache_read: 0, cache_create: 0 },
     toolCounts: {},
     cardCount: 0,
@@ -1068,7 +1315,7 @@ async function loadTabContent(tab) {
   const loadingEl = document.createElement('div');
   loadingEl.className = 'tab-loading';
   loadingEl.textContent = t('sessions_loading');
-  tab.mainEl.appendChild(loadingEl);
+  tab.turnsHost.appendChild(loadingEl);
   try {
     const res = await fetch('/session/' + encodeURIComponent(tab.sessionId));
     if (!res.ok) return;
@@ -1118,6 +1365,13 @@ function closeTab(sessionId) {
   const tab = tabs.get(sessionId);
   if (!tab) return;
   if (activeThread && activeThread.tab === tab) closeThread();
+  // If the tab owned a PTY, close the WS and tell the server to kill the
+  // child. We forget the map entry so refresh won't try to reattach.
+  if (tab.ptyId) {
+    try { tab.ws && tab.ws.close(); } catch {}
+    try { fetch('/pty/' + tab.ptyId, { method: 'DELETE' }); } catch {}
+    forgetPtyForTab(sessionId);
+  }
   const grp = tab.tabEl.parentElement;
   tab.tabEl.remove();
   if (grp && grp.classList.contains('tab-group') && !grp.querySelector('.tab')) grp.remove();
@@ -1212,9 +1466,7 @@ function renderSide(tab) {
       [t('project'), projectDisplayName(tab.project, tabCwd), tabCwd || tab.path || ''],
       [t('session_id'), tab.sessionId.slice(0, 8) + '…', tab.sessionId],
     ].map(([k, v, full]) => '<div class="stat"><span>' + esc(k) + '</span><span title="' + esc(full) + '">' + esc(v) + '</span></div>').join('');
-    tokensEl.innerHTML = Object.entries(tab.tokens).map(([k, v]) =>
-      '<div class="stat"><span>' + k + '</span><span>' + v.toLocaleString() + '</span></div>'
-    ).join('');
+    renderTokens(tab, { animate: false });
     toolsEl.innerHTML = Object.entries(tab.toolCounts).sort((a, b) => b[1] - a[1]).map(([k, v]) =>
       '<div class="stat tool-row tool-' + esc(k) + (pinnedTools.has(k) ? ' active' : '') + '" data-tool="' + esc(k) + '"><span>' + esc(k) + '</span><span>' + v + '</span></div>'
     ).join('') || '<div class="stat"><span style="color:#444">—</span><span></span></div>';
@@ -1486,7 +1738,7 @@ function startNewTurn(tab, userCard) {
     openThread(turn);
   });
 
-  const mainEl = tab.mainEl;
+  const mainEl = tab.turnsHost;
   const atBottom = mainEl.scrollTop + mainEl.clientHeight >= mainEl.scrollHeight - 40;
   mainEl.appendChild(userCard);
   if (atBottom && tab.sessionId === activeTabId) mainEl.scrollTop = mainEl.scrollHeight;
@@ -1677,7 +1929,7 @@ document.getElementById('clearBtn').addEventListener('click', () => {
   const tab = getActiveTab();
   if (!tab) return;
   if (activeThread && activeThread.tab === tab) closeThread();
-  tab.mainEl.innerHTML = '';
+  tab.turnsHost.innerHTML = '';
   tab.turnsRoot.innerHTML = '';
   tab.turns = [];
   tab.currentTurn = null;
@@ -1807,7 +2059,11 @@ function processLine(text) {
     }
     return;
   }
-  if (j.__monitor === 'session') { ensureTab(j.session, j.project, j.path, j.cwd); return; }
+  if (j.__monitor === 'session') {
+    ensureTab(j.session, j.project, j.path, j.cwd);
+    tryMatchPendingPtyToSession(j.session, j.cwd);
+    return;
+  }
   if (j.__monitor === 'session-removed') {
     const tab = tabs.get(j.session);
     if (!tab) return;
@@ -1929,6 +2185,7 @@ function renderEvent(tab, j) {
       tab.tokens.output += u.output_tokens || 0;
       tab.tokens.cache_read += u.cache_read_input_tokens || 0;
       tab.tokens.cache_create += u.cache_creation_input_tokens || 0;
+      if (tab.sessionId === activeTabId) renderTokens(tab, { animate: true });
     }
   }
 }
@@ -1942,6 +2199,36 @@ try {
   }
   if (savedActive && tabs.has(savedActive)) switchTab(savedActive);
 } catch {}
+
+// Reattach to PTYs that survived the page reload (server keeps them alive).
+(async () => {
+  let map;
+  try { map = loadPtyMap(); } catch { return; }
+  if (!map.size) return;
+  let alive;
+  try {
+    const res = await fetch('/pty');
+    if (!res.ok) return;
+    alive = new Map((await res.json()).map((p) => [p.id, p]));
+  } catch { return; }
+  for (const [sessionId, { ptyId, cwd }] of map) {
+    if (!alive.has(ptyId) || alive.get(ptyId).exited) {
+      forgetPtyForTab(sessionId);
+      continue;
+    }
+    let tab = tabs.get(sessionId);
+    if (!tab) {
+      // Tab not in saved tabs (placeholder, or session that fell out of window).
+      // Re-create a placeholder so the user sees the terminal back.
+      const project = (cwd || '').split('/').filter(Boolean).join('-') || 'pty';
+      ensureTab(sessionId, project, '', cwd);
+      tab = tabs.get(sessionId);
+      if (tab) tab.isPtyPlaceholder = sessionId.startsWith('pty:');
+    }
+    if (tab) attachPtyToTab(tab, ptyId, cwd);
+    if (!activeTabId) switchTab(sessionId);
+  }
+})();
 
 const es = new EventSource('/events');
 es.onopen = () => setConnState('live');
@@ -1979,6 +2266,469 @@ settingsBtn.addEventListener('click', () => setSettings(true));
 settingsCloseBtn.addEventListener('click', () => setSettings(false));
 settingsBackdrop.addEventListener('click', (e) => { if (e.target === settingsBackdrop) setSettings(false); });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && settingsBackdrop.classList.contains('open')) setSettings(false); });
+
+// ── Confirm modal (replaces native confirm) ─────────────────────────────────
+const confirmBackdrop = document.getElementById('confirmBackdrop');
+const confirmTitleEl  = document.getElementById('confirmTitle');
+const confirmBodyEl   = document.getElementById('confirmBody');
+const confirmCloseBtn = document.getElementById('confirmClose');
+const confirmCancelBtn= document.getElementById('confirmCancel');
+const confirmOkBtn    = document.getElementById('confirmOk');
+let confirmResolve = null;
+function confirmDialog({ title, bodyHtml, okText, cancelText, okClass }) {
+  confirmTitleEl.textContent = title || '확인';
+  confirmBodyEl.innerHTML = bodyHtml || '';
+  confirmOkBtn.textContent = okText || '진행';
+  confirmCancelBtn.textContent = cancelText || '취소';
+  confirmOkBtn.className = 'btn ' + (okClass || 'btn--primary');
+  confirmBackdrop.classList.add('open');
+  return new Promise((resolve) => { confirmResolve = resolve; });
+}
+function closeConfirm(result) {
+  confirmBackdrop.classList.remove('open');
+  const r = confirmResolve; confirmResolve = null;
+  if (r) r(result);
+}
+confirmOkBtn.addEventListener('click', () => closeConfirm(true));
+confirmCancelBtn.addEventListener('click', () => closeConfirm(false));
+confirmCloseBtn.addEventListener('click', () => closeConfirm(false));
+confirmBackdrop.addEventListener('click', (e) => { if (e.target === confirmBackdrop) closeConfirm(false); });
+document.addEventListener('keydown', (e) => {
+  if (!confirmBackdrop.classList.contains('open')) return;
+  if (e.key === 'Escape') closeConfirm(false);
+  else if (e.key === 'Enter') closeConfirm(true);
+});
+
+// ── Spawn modal + PTY tracking ──────────────────────────────────────────────
+const spawnBackdrop = document.getElementById('spawnBackdrop');
+const spawnCloseBtn = document.getElementById('spawnClose');
+const spawnBtn = document.getElementById('spawnBtn');
+const spawnCwdInput = document.getElementById('spawnCwd');
+const spawnRecentEl = document.getElementById('spawnRecent');
+const spawnConfirmBtn = document.getElementById('spawnConfirm');
+const spawnCancelBtn = document.getElementById('spawnCancel');
+
+// Pending PTYs keyed by normalized cwd → ptyId. When a JSONL session with the
+// same cwd arrives, we attach the PTY to that tab.
+const pendingPtysByCwd = new Map();
+function normCwd(p) { return String(p || '').trim().replace(/\/+$/, '') || ''; }
+
+// Persist sessionId → ptyId in localStorage so a page reload can reattach to
+// the still-running PTY (server keeps PTY alive across reconnects).
+function loadPtyMap() {
+  try { return new Map(Object.entries(JSON.parse(localStorage.getItem('cm-pty-map') || '{}'))); }
+  catch { return new Map(); }
+}
+function savePtyMap(map) {
+  try { localStorage.setItem('cm-pty-map', JSON.stringify(Object.fromEntries(map))); } catch {}
+}
+function rememberPtyForTab(sessionId, ptyId, cwd) {
+  const map = loadPtyMap();
+  map.set(sessionId, { ptyId, cwd: cwd || '' });
+  savePtyMap(map);
+}
+function forgetPtyForTab(sessionId) {
+  const map = loadPtyMap();
+  if (map.delete(sessionId)) savePtyMap(map);
+}
+function rekeyPtyForTab(fromSessionId, toSessionId) {
+  const map = loadPtyMap();
+  const e = map.get(fromSessionId);
+  if (!e) return;
+  map.delete(fromSessionId);
+  map.set(toSessionId, e);
+  savePtyMap(map);
+}
+
+function setSpawnModal(open) {
+  spawnBackdrop.classList.toggle('open', open);
+  if (open) {
+    const active = getActiveTab();
+    const activeCwd = (active && (active.cwd || (active.inventory && active.inventory.cwd))) || '';
+    spawnCwdInput.value = activeCwd || lastSpawnCwd() || (collectKnownCwds()[0] || '');
+    renderRecentCwds();
+    setTimeout(() => { spawnCwdInput.focus(); spawnCwdInput.select(); }, 0);
+  }
+}
+function lastSpawnCwd() { try { return localStorage.getItem('cm-last-spawn-cwd') || ''; } catch { return ''; } }
+function rememberSpawnCwd(cwd) {
+  try {
+    localStorage.setItem('cm-last-spawn-cwd', cwd);
+    const list = JSON.parse(localStorage.getItem('cm-recent-cwds') || '[]').filter((x) => x !== cwd);
+    list.unshift(cwd);
+    localStorage.setItem('cm-recent-cwds', JSON.stringify(list.slice(0, 10)));
+  } catch {}
+}
+function recentSavedCwds() {
+  try { return JSON.parse(localStorage.getItem('cm-recent-cwds') || '[]'); } catch { return []; }
+}
+function collectKnownCwds() {
+  const set = new Set(recentSavedCwds());
+  for (const tab of tabs.values()) if (tab.cwd) set.add(tab.cwd);
+  return [...set];
+}
+function renderRecentCwds() {
+  spawnRecentEl.innerHTML = '';
+  for (const cwd of collectKnownCwds().slice(0, 12)) {
+    const b = document.createElement('button');
+    b.textContent = cwd;
+    b.title = cwd;
+    b.addEventListener('click', () => { spawnCwdInput.value = cwd; });
+    spawnRecentEl.appendChild(b);
+  }
+}
+
+spawnBtn.addEventListener('click', () => setSpawnModal(true));
+spawnCloseBtn.addEventListener('click', () => setSpawnModal(false));
+spawnCancelBtn.addEventListener('click', () => setSpawnModal(false));
+spawnBackdrop.addEventListener('click', (e) => { if (e.target === spawnBackdrop) setSpawnModal(false); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && spawnBackdrop.classList.contains('open')) setSpawnModal(false); });
+spawnCwdInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); spawnConfirmBtn.click(); } });
+
+// Per-tab pty pane height (px). Stored across reloads.
+function loadPtyHeight(sessionId) {
+  try { const m = JSON.parse(localStorage.getItem('cm-pty-heights') || '{}'); return Number(m[sessionId]) || 0; } catch { return 0; }
+}
+function savePtyHeight(sessionId, h) {
+  try {
+    const m = JSON.parse(localStorage.getItem('cm-pty-heights') || '{}');
+    m[sessionId] = h;
+    localStorage.setItem('cm-pty-heights', JSON.stringify(m));
+  } catch {}
+}
+
+function applyPtyHeight(pane, ptyHost, sessionId) {
+  const saved = loadPtyHeight(sessionId);
+  if (saved > 0) pane.style.setProperty('--pty-h', saved + 'px');
+}
+
+function wirePtyResizer(pane, ptyHost, resizer, sessionId) {
+  applyPtyHeight(pane, ptyHost, sessionId);
+  resizer.addEventListener('mousedown', (ev) => {
+    ev.preventDefault();
+    resizer.classList.add('dragging');
+    const paneRect = pane.getBoundingClientRect();
+    const startY = ev.clientY;
+    const startH = ptyHost.getBoundingClientRect().height;
+    function onMove(e) {
+      const dy = e.clientY - startY;
+      let next = startH - dy;
+      const minH = 120;
+      const maxH = paneRect.height - 60;
+      next = Math.max(minH, Math.min(maxH, next));
+      pane.style.setProperty('--pty-h', next + 'px');
+    }
+    function onUp() {
+      resizer.classList.remove('dragging');
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      const finalH = ptyHost.getBoundingClientRect().height;
+      savePtyHeight(sessionId, Math.round(finalH));
+      const tab = tabs.get(sessionId);
+      if (tab && tab.fit) { try { tab.fit.fit(); } catch {} }
+    }
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+}
+
+async function spawnAndAttachInline(tab, cwd) {
+  if (!tab || !cwd) return null;
+  // Resume from the tab's existing session if it's a real (non-placeholder) one,
+  // so the new claude inherits prior conversation context. --fork-session keeps
+  // its writes in a new JSONL so the original session isn't mutated.
+  const resume = tab.sessionId && !tab.sessionId.startsWith('pty:') ? tab.sessionId : null;
+  // Make sure historical events are processed so tab.tokens reflects the real
+  // session size before we decide whether to warn.
+  if (resume && !tab.loaded) {
+    try { await loadTabContent(tab); } catch {}
+  }
+  // Warn before resuming a long session. Resume cost ≈ entire conversation
+  // is re-sent and re-cached in the new claude process (the original process's
+  // cache_read doesn't transfer). output + cache_create is the proxy for
+  // "how much the new process has to ingest".
+  if (resume) {
+    const tk = tab.tokens || {};
+    const out = tk.output || 0;
+    const inTok = tk.input || 0;
+    const cr = tk.cache_read || 0;
+    const cc = tk.cache_create || 0;
+    // Best proxy: cache_create alone ≈ unique conversation tokens accumulated.
+    // output is already part of the cached prompt body, so adding it would
+    // double-count. cache_read is a hit counter, not transferable to a new process.
+    const resendEstimate = cc;
+    const heavy = resendEstimate >= 10000 || (tab.cardCount || 0) >= 30;
+    if (heavy) {
+      const fmt = (n) => n.toLocaleString();
+      const bodyHtml =
+        '<div class="resume-cost">' +
+          '<div class="intro">이전 대화를 들고 새 터미널을 엽니다. 터미널 자체는 즉시 뜨고, <strong>첫 메시지를 보낼 때</strong> 히스토리가 모델에 전송되며 cache_create로 청구됩니다.</div>' +
+          '<div class="section-label">이 세션 누적</div>' +
+          '<div class="stats">' +
+            '<span class="k">카드</span><span class="v">' + (tab.cardCount || 0) + '</span>' +
+            '<span class="k">output</span><span class="v muted">' + fmt(out) + '</span>' +
+            '<span class="k">input (비캐시)</span><span class="v muted">' + fmt(inTok) + '</span>' +
+            '<span class="k">cache_read</span><span class="v muted">' + fmt(cr) + '</span>' +
+            '<span class="k">cache_create</span><span class="v">' + fmt(cc) + '</span>' +
+            '<div class="row-note">cache_create ≈ 실제 대화 길이. cache_read는 옛 프로세스 캐시 히트 누적으로 새 프로세스에선 무효.</div>' +
+          '</div>' +
+          '<div class="section-label">resume 추정 비용 (첫 메시지)</div>' +
+          '<div class="estimate"><span class="num">≈ ' + fmt(resendEstimate) + '</span><span class="label">토큰 cache_create</span></div>' +
+          '<div class="note">새 claude가 옛 대화 위에서 이어 작업. <code>--fork-session</code>으로 별개 JSONL에 기록되니 원본은 안 건드림.</div>' +
+        '</div>';
+      const ok = await confirmDialog({ title: '터미널 열기 — 비용 확인', bodyHtml, okText: '진행', cancelText: '취소' });
+      if (!ok) return null;
+    }
+  }
+  try {
+    const res = await fetch('/pty', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cwd, cols: 100, rows: 30, resume }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      alert('Spawn failed: ' + (err.message || res.statusText));
+      return null;
+    }
+    const { id } = await res.json();
+    rememberSpawnCwd(normCwd(cwd));
+    await attachPtyToTab(tab, id, cwd);
+    return id;
+  } catch (err) {
+    alert('Spawn failed: ' + (err.message || err));
+    return null;
+  }
+}
+
+async function spawnInCwd(cwd) {
+  if (!cwd) return null;
+  try {
+    const res = await fetch('/pty', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cwd, cols: 100, rows: 30 }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      alert('Spawn failed: ' + (err.message || res.statusText));
+      return null;
+    }
+    const { id } = await res.json();
+    const ncwd = normCwd(cwd);
+    rememberSpawnCwd(ncwd);
+    pendingPtysByCwd.set(ncwd, id);
+    const placeholderId = 'pty:' + id;
+    ensureTab(placeholderId, cwd.split('/').filter(Boolean).join('-') || 'pty', '', cwd);
+    const tab = tabs.get(placeholderId);
+    if (tab) {
+      tab.cwd = cwd;
+      tab.isPtyPlaceholder = true;
+      attachPtyToTab(tab, id, cwd);
+      switchTab(placeholderId);
+    }
+    return id;
+  } catch (err) {
+    alert('Spawn failed: ' + (err.message || err));
+    return null;
+  }
+}
+
+spawnConfirmBtn.addEventListener('click', async () => {
+  const cwd = (spawnCwdInput.value || '').trim();
+  if (!cwd) { spawnCwdInput.focus(); return; }
+  spawnConfirmBtn.disabled = true;
+  try {
+    const id = await spawnInCwd(cwd);
+    if (id) setSpawnModal(false);
+  } finally {
+    spawnConfirmBtn.disabled = false;
+  }
+});
+
+// xterm.js dynamic imports (deferred — only loaded the first time a PTY is opened)
+let xtermModulePromise = null;
+function loadXtermModule() {
+  if (!xtermModulePromise) {
+    xtermModulePromise = Promise.all([
+      import('/assets/xterm.mjs'),
+      import('/assets/xterm-fit.mjs'),
+    ]).then(([t, f]) => ({ Terminal: t.Terminal, FitAddon: f.FitAddon }));
+  }
+  return xtermModulePromise;
+}
+
+async function attachPtyToTab(tab, ptyId, cwd) {
+  if (tab.ptyId) return; // already attached
+  tab.ptyId = ptyId;
+  tab.ptyCwd = cwd || tab.cwd || '';
+  rememberPtyForTab(tab.sessionId, ptyId, tab.ptyCwd);
+  tab.mainEl.classList.add('has-pty');
+  // Mark the tab visually
+  const label = tab.tabEl.querySelector('.tab-label');
+  if (label && !label.previousSibling?.classList?.contains('tab-pty-mark')) {
+    const mark = document.createElement('span');
+    mark.className = 'tab-pty-mark';
+    mark.textContent = '⬢';
+    mark.title = 'attached PTY';
+    label.parentNode.insertBefore(mark, label);
+  }
+
+  const ptyBar = document.createElement('div');
+  ptyBar.className = 'pty-bar';
+  ptyBar.innerHTML =
+    '<span class="pty-status" data-pty-status>live</span>' +
+    '<span class="pty-cwd" title="' + esc(tab.ptyCwd) + '">' + esc(tab.ptyCwd) + '</span>' +
+    '<button data-act="respawn" hidden>다시 띄우기</button>' +
+    '<button data-act="kill" title="Kill terminal">×</button>';
+  const termEl = document.createElement('div');
+  termEl.className = 'pty-term';
+  tab.ptyHost.innerHTML = '';
+  tab.ptyHost.appendChild(ptyBar);
+  tab.ptyHost.appendChild(termEl);
+
+  ptyBar.querySelector('[data-act="kill"]').addEventListener('click', async () => {
+    try { await fetch('/pty/' + ptyId, { method: 'DELETE' }); } catch {}
+  });
+  // Click the bar (not its buttons) to toggle full-screen for this tab pane.
+  ptyBar.addEventListener('click', (e) => {
+    if (e.target.closest('button')) return;
+    tab.mainEl.classList.toggle('pty-fullscreen');
+    requestAnimationFrame(() => { try { tab.fit && tab.fit.fit(); } catch {} });
+  });
+  ptyBar.querySelector('[data-act="respawn"]').addEventListener('click', async () => {
+    const cwdCopy = tab.ptyCwd || '';
+    // Tear down current xterm + state for this tab
+    try { tab.ws && tab.ws.close(); } catch {}
+    try { tab.term && tab.term.dispose(); } catch {}
+    forgetPtyForTab(tab.sessionId);
+    tab.ptyId = null; tab.term = null; tab.fit = null; tab.ws = null;
+    tab.mainEl.classList.remove('has-pty');
+    tab.ptyHost.innerHTML = '';
+    if (cwdCopy) await spawnAndAttachInline(tab, cwdCopy);
+  });
+
+  let mod;
+  try { mod = await loadXtermModule(); }
+  catch (err) {
+    termEl.innerHTML = '<div style="color:#fca5a5;padding:12px;font-family:ui-monospace,Menlo,monospace;font-size:12px">xterm load failed: ' + esc(String(err)) + '</div>';
+    return;
+  }
+  const { Terminal, FitAddon } = mod;
+  const term = new Terminal({
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+    fontSize: 13,
+    theme: { background: '#0c0d0f' },
+    cursorBlink: true,
+    convertEol: true,
+    scrollback: 5000,
+  });
+  const fit = new FitAddon();
+  term.loadAddon(fit);
+  // Wait until termEl has a non-zero size before opening — xterm gives up if the
+  // container is 0×0 at open() time.
+  await new Promise((resolve) => {
+    const tryOnce = () => {
+      if (termEl.clientWidth > 0 && termEl.clientHeight > 0) resolve();
+      else requestAnimationFrame(tryOnce);
+    };
+    tryOnce();
+  });
+  term.open(termEl);
+  try { fit.fit(); } catch {}
+  term.focus();
+  // Wheel events forward to tmux through xterm default mouse handling.
+  // The backend session has mouse=on so tmux interprets wheel as enter-copy
+  // mode and scrolls. claude (alt-screen TUI) never sees the event.
+  tab.term = term;
+  tab.fit = fit;
+
+  const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(wsProto + '//' + location.host + '/pty/' + ptyId);
+  tab.ws = ws;
+  ws.addEventListener('open', () => {
+    ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+  });
+  ws.addEventListener('message', (ev) => {
+    let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+    if (msg.type === 'data') term.write(msg.data);
+    else if (msg.type === 'exit') {
+      const st = ptyBar.querySelector('[data-pty-status]');
+      if (st) { st.textContent = 'exited (' + (msg.exitCode ?? '?') + ')'; st.classList.add('exited'); }
+      forgetPtyForTab(tab.sessionId);
+    }
+  });
+  ws.addEventListener('close', () => {
+    const st = ptyBar.querySelector('[data-pty-status]');
+    if (st && !st.classList.contains('exited')) { st.textContent = 'disconnected'; st.classList.add('exited'); }
+    const re = ptyBar.querySelector('[data-act="respawn"]');
+    if (re) re.hidden = false;
+  });
+  term.onData((data) => { if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'input', data })); });
+  term.onResize(({ cols, rows }) => {
+    if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+  });
+
+  // Refit on resize
+  const ro = new ResizeObserver(() => { try { fit.fit(); } catch {} });
+  ro.observe(termEl);
+}
+
+function tryMatchPendingPtyToSession(sessionId, cwd) {
+  const ncwd = normCwd(cwd);
+  if (!ncwd) return;
+  const ptyId = pendingPtysByCwd.get(ncwd);
+  if (!ptyId) return;
+  pendingPtysByCwd.delete(ncwd);
+  // Move the PTY from the placeholder tab onto the real session tab, then drop
+  // the placeholder so the user sees a single unified tab.
+  const placeholderId = 'pty:' + ptyId;
+  const realTab = tabs.get(sessionId);
+  const placeholderTab = tabs.get(placeholderId);
+  if (!realTab) return;
+  if (placeholderTab && placeholderTab !== realTab) {
+    const wasActive = activeTabId === placeholderId;
+    // Move PTY DOM nodes (xterm, bar) into real tab's ptyHost — preserves
+    // xterm renderer state, WS bindings, and event listeners.
+    realTab.ptyHost.innerHTML = '';
+    while (placeholderTab.ptyHost.firstChild) {
+      realTab.ptyHost.appendChild(placeholderTab.ptyHost.firstChild);
+    }
+    realTab.mainEl.classList.add('has-pty');
+    placeholderTab.mainEl.classList.remove('has-pty');
+    realTab.ptyId = placeholderTab.ptyId;
+    realTab.term = placeholderTab.term;
+    realTab.fit = placeholderTab.fit;
+    realTab.ws = placeholderTab.ws;
+    realTab.ptyCwd = placeholderTab.ptyCwd;
+    // Mirror the ⬢ marker
+    const label = realTab.tabEl.querySelector('.tab-label');
+    if (label && !label.previousSibling?.classList?.contains('tab-pty-mark')) {
+      const mark = document.createElement('span');
+      mark.className = 'tab-pty-mark';
+      mark.textContent = '⬢';
+      mark.title = 'attached PTY';
+      label.parentNode.insertBefore(mark, label);
+    }
+    // Reparent xterm DOM (term.open() works for re-mount and re-attaches renderer)
+    const newContainer = realTab.ptyHost.querySelector('.pty-term');
+    if (newContainer && realTab.term) {
+      try { realTab.term.open(newContainer); } catch {}
+      requestAnimationFrame(() => { try { realTab.fit.fit(); } catch {} });
+    }
+    rekeyPtyForTab(placeholderId, realTab.sessionId);
+    // Clear the placeholder's PTY refs so closeTab below doesn't try to kill
+    // the PTY we just transferred.
+    placeholderTab.ptyId = null;
+    placeholderTab.term = null;
+    placeholderTab.fit = null;
+    placeholderTab.ws = null;
+    // Switch first, then drop placeholder — avoids closeTab's auto-pick falling
+    // back to some unrelated tab.
+    if (wasActive) switchTab(realTab.sessionId);
+    closeTab(placeholderId);
+  } else {
+    attachPtyToTab(realTab, ptyId, cwd);
+  }
+}
 
 const drawerEl = document.getElementById('drawer');
 const drawerBackdropEl = document.getElementById('drawerBackdrop');
@@ -2143,7 +2893,211 @@ drawerListEl.addEventListener('click', async (e) => {
 });
 </script></body></html>`;
 
-http.createServer((req, res) => {
+// ────────────────────────────────────────────────────────────────────────────
+// PTY backend — spawn `claude` per browser tab, bridge stdio over WebSocket.
+// Observation (JSONL tail) handles the cards; PTY handles direct input/output.
+// ────────────────────────────────────────────────────────────────────────────
+const ptys = new Map(); // ptyId -> { proc, cwd, cols, rows, buffer, sockets:Set, exited }
+const PTY_BUFFER_MAX = 200_000; // bytes of recent output kept for reconnects
+
+function findClaudeBin() {
+  if (process.env.CC_MONITOR_CLAUDE_BIN) return process.env.CC_MONITOR_CLAUDE_BIN;
+  // Walk PATH first — covers nvm-style installs, ~/.local/bin, etc.
+  const pathEntries = (process.env.PATH || '').split(path.delimiter);
+  for (const dir of pathEntries) {
+    if (!dir) continue;
+    const fp = path.join(dir, 'claude');
+    try { fs.accessSync(fp, fs.constants.X_OK); return fp; } catch {}
+  }
+  // Common install locations as fallback.
+  const candidates = [
+    path.join(os.homedir(), '.local', 'bin', 'claude'),
+    path.join(os.homedir(), '.claude', 'local', 'claude'),
+    '/opt/homebrew/bin/claude',
+    '/usr/local/bin/claude',
+  ];
+  for (const c of candidates) { try { fs.accessSync(c, fs.constants.X_OK); return c; } catch {} }
+  return 'claude';
+}
+
+function findTmuxBin() {
+  if (process.env.CC_MONITOR_TMUX_BIN) return process.env.CC_MONITOR_TMUX_BIN;
+  for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+    if (!dir) continue;
+    const fp = path.join(dir, 'tmux');
+    try { fs.accessSync(fp, fs.constants.X_OK); return fp; } catch {}
+  }
+  for (const c of ['/opt/homebrew/bin/tmux', '/usr/local/bin/tmux', '/usr/bin/tmux']) {
+    try { fs.accessSync(c, fs.constants.X_OK); return c; } catch {}
+  }
+  return null;
+}
+
+const TMUX_BIN = findTmuxBin();
+const TMUX_PREFIX = 'cm-';
+const tmuxName = (ptyId) => TMUX_PREFIX + ptyId;
+
+// Spawns a tmux session running `claude`, then returns a local PTY attached
+// to that tmux session. The session outlives this monitor process, so when
+// monitor restarts the tmux session (and claude) survive.
+async function spawnClaudePty(ptyId, cwd, cols, rows, resumeSessionId) {
+  if (!TMUX_BIN) {
+    throw new Error('tmux not found. Install: `brew install tmux` (macOS) or `apt install tmux` (linux).');
+  }
+  if (process.platform === 'darwin' && process.arch === 'x64' && os.cpus()[0]?.model?.match(/Apple/i)) {
+    throw new Error(
+      'Detected x64 Node on Apple Silicon. node-pty requires native architecture. ' +
+      'Switch to arm64 Node (e.g. `nvm install 20 && nvm use 20` on an arm64 shell).'
+    );
+  }
+  const claudeBin = findClaudeBin();
+  const name = tmuxName(ptyId);
+  const safeCwd = cwd && fs.existsSync(cwd) ? cwd : (process.env.HOME || process.cwd());
+  const newArgs = [
+    'new-session', '-d', '-s', name,
+    '-x', String(cols || 100), '-y', String(rows || 30),
+    '-c', safeCwd,
+    '--', claudeBin,
+  ];
+  if (resumeSessionId) newArgs.push('--resume', String(resumeSessionId), '--fork-session');
+  await execFileP(TMUX_BIN, newArgs);
+  // Hide tmux status bar so the terminal looks like a plain shell
+  await execFileP(TMUX_BIN, ['set-option', '-t', name, 'status', 'off']).catch(() => {});
+  await execFileP(TMUX_BIN, ['set-option', '-t', name, 'history-limit', '50000']).catch(() => {});
+  // Follow the attached client's size so the inner pane resizes with the browser.
+  await execFileP(TMUX_BIN, ['set-option', '-t', name, 'window-size', 'latest']).catch(() => {});
+  await execFileP(TMUX_BIN, ['set-window-option', '-t', name, 'aggressive-resize', 'on']).catch(() => {});
+  // Mouse on: wheel enters copy-mode + scrolls. Right scroll past last line exits.
+  await execFileP(TMUX_BIN, ['set-option', '-t', name, 'mouse', 'on']).catch(() => {});
+  return attachLocalToTmux(name, cols, rows, safeCwd);
+}
+
+async function attachLocalToTmux(sessionName, cols, rows, cwd) {
+  const pty = await getNodePty();
+  const env = { ...process.env, TERM: 'xterm-256color' };
+  return pty.spawn(TMUX_BIN, ['attach-session', '-t', sessionName], {
+    name: 'xterm-256color',
+    cwd: cwd || process.env.HOME || '/tmp',
+    cols: cols || 100,
+    rows: rows || 30,
+    env,
+  });
+}
+
+async function killTmuxSession(ptyId) {
+  if (!TMUX_BIN) return;
+  await execFileP(TMUX_BIN, ['kill-session', '-t', tmuxName(ptyId)]).catch(() => {});
+}
+
+async function listTmuxClaudeSessions() {
+  if (!TMUX_BIN) return [];
+  try {
+    const { stdout } = await execFileP(TMUX_BIN, [
+      'list-sessions', '-F',
+      '#{session_name}|#{session_path}|#{window_width}|#{window_height}',
+    ]);
+    return stdout.split('\n').filter(Boolean).filter((l) => l.startsWith(TMUX_PREFIX)).map((line) => {
+      const [name, sessionPath, w, h] = line.split('|');
+      return {
+        ptyId: name.slice(TMUX_PREFIX.length),
+        name,
+        cwd: sessionPath || '',
+        cols: parseInt(w, 10) || 100,
+        rows: parseInt(h, 10) || 30,
+      };
+    });
+  } catch { return []; }
+}
+
+function registerPtyEntry({ id, proc, cwd, cols, rows }) {
+  const pty = { proc, cwd, cols, rows, buffer: '', sockets: new Set(), exited: false };
+  ptys.set(id, pty);
+  proc.onData((data) => {
+    pty.buffer = (pty.buffer + data).slice(-PTY_BUFFER_MAX);
+    broadcastPty(pty, { type: 'data', data });
+  });
+  proc.onExit(({ exitCode, signal }) => {
+    pty.exited = true;
+    broadcastPty(pty, { type: 'exit', exitCode, signal });
+    setTimeout(() => {
+      for (const ws of pty.sockets) { try { ws.close(); } catch {} }
+      ptys.delete(id);
+    }, 5_000);
+  });
+  return pty;
+}
+
+async function rehydrateFromTmux() {
+  if (!TMUX_BIN) return;
+  const sessions = await listTmuxClaudeSessions();
+  for (const s of sessions) {
+    if (ptys.has(s.ptyId)) continue;
+    try {
+      const proc = await attachLocalToTmux(s.name, s.cols, s.rows, s.cwd);
+      registerPtyEntry({ id: s.ptyId, proc, cwd: s.cwd, cols: s.cols, rows: s.rows });
+      console.log('rehydrated tmux session:', s.name);
+    } catch (err) {
+      console.error('rehydrate failed for', s.name, err.message);
+    }
+  }
+}
+
+function attachSocket(pty, ws) {
+  pty.sockets.add(ws);
+  // Replay buffered output so the reconnecting tab catches up.
+  if (pty.buffer && pty.buffer.length) {
+    try { ws.send(JSON.stringify({ type: 'data', data: pty.buffer })); } catch {}
+  }
+  ws.on('message', (raw) => {
+    let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
+    if (msg.type === 'input' && typeof msg.data === 'string') {
+      try { pty.proc.write(msg.data); } catch {}
+    } else if (msg.type === 'resize' && Number.isFinite(msg.cols) && Number.isFinite(msg.rows)) {
+      pty.cols = msg.cols; pty.rows = msg.rows;
+      try { pty.proc.resize(msg.cols, msg.rows); } catch {}
+    }
+  });
+  ws.on('close', () => pty.sockets.delete(ws));
+  ws.on('error', () => pty.sockets.delete(ws));
+}
+
+function broadcastPty(pty, frame) {
+  const payload = JSON.stringify(frame);
+  for (const ws of pty.sockets) {
+    if (ws.readyState === 1) { try { ws.send(payload); } catch {} }
+  }
+}
+
+async function readJsonBody(req, limit = 64 * 1024) {
+  return new Promise((resolve, reject) => {
+    let len = 0; const chunks = [];
+    req.on('data', (c) => { len += c.length; if (len > limit) { req.destroy(); reject(new Error('body too large')); return; } chunks.push(c); });
+    req.on('end', () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}')); } catch (e) { reject(e); } });
+    req.on('error', reject);
+  });
+}
+
+function serveStatic(req, res, fp, contentType) {
+  try {
+    const st = fs.statSync(fp);
+    res.writeHead(200, {
+      'Content-Type': contentType,
+      'Content-Length': st.size,
+      'Cache-Control': 'public, max-age=86400',
+    });
+    fs.createReadStream(fp).pipe(res);
+  } catch {
+    res.writeHead(404); res.end('not found');
+  }
+}
+
+const XTERM_ASSETS = {
+  '/assets/xterm.css':       { fp: path.join(__dirname, 'node_modules/@xterm/xterm/css/xterm.css'),               type: 'text/css; charset=utf-8' },
+  '/assets/xterm.mjs':       { fp: path.join(__dirname, 'node_modules/@xterm/xterm/lib/xterm.mjs'),               type: 'application/javascript; charset=utf-8' },
+  '/assets/xterm-fit.mjs':   { fp: path.join(__dirname, 'node_modules/@xterm/addon-fit/lib/addon-fit.mjs'),       type: 'application/javascript; charset=utf-8' },
+};
+
+const server = http.createServer((req, res) => {
   if (req.url === '/events') {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -2228,11 +3182,77 @@ http.createServer((req, res) => {
     }
     return;
   }
+  if (XTERM_ASSETS[req.url]) {
+    const a = XTERM_ASSETS[req.url];
+    serveStatic(req, res, a.fp, a.type);
+    return;
+  }
+  if (req.url === '/pty' && req.method === 'GET') {
+    const list = [...ptys.entries()].map(([id, p]) => ({
+      id, cwd: p.cwd, cols: p.cols, rows: p.rows, exited: !!p.exited, attached: p.sockets.size > 0,
+    }));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(list));
+    return;
+  }
+  if (req.url === '/pty' && req.method === 'POST') {
+    readJsonBody(req).then(async (body) => {
+      const cwd = body.cwd || process.env.HOME || process.cwd();
+      const cols = Number.isFinite(body.cols) ? body.cols : 100;
+      const rows = Number.isFinite(body.rows) ? body.rows : 30;
+      const resume = typeof body.resume === 'string' ? body.resume : null;
+      const id = crypto.randomUUID();
+      let proc;
+      try { proc = await spawnClaudePty(id, cwd, cols, rows, resume); }
+      catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'spawn_failed', message: String(err.message || err) }));
+        return;
+      }
+      registerPtyEntry({ id, proc, cwd, cols, rows });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ id, cwd, cols, rows }));
+    }).catch((err) => {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'bad_body', message: String(err.message || err) }));
+    });
+    return;
+  }
+  if (req.url.startsWith('/pty/') && req.method === 'DELETE') {
+    const id = req.url.slice('/pty/'.length);
+    const pty = ptys.get(id);
+    if (!pty) { res.writeHead(404); res.end('not found'); return; }
+    // Tell tmux to kill the session — local PTY (attach) will exit naturally.
+    killTmuxSession(id).finally(() => {
+      try { pty.proc.kill(); } catch {}
+    });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(HTML);
-}).listen(PORT, () => {
-  console.log(`Claude Monitor → http://localhost:${PORT}`);
 });
 
-process.on('SIGINT', () => process.exit(0));
-process.on('SIGTERM', () => process.exit(0));
+const wss = new WebSocketServer({ noServer: true });
+server.on('upgrade', (req, socket, head) => {
+  const url = new URL(req.url, 'http://localhost');
+  const m = url.pathname.match(/^\/pty\/([0-9a-f-]{36})$/i);
+  if (!m) { socket.destroy(); return; }
+  const pty = ptys.get(m[1]);
+  if (!pty) { socket.write('HTTP/1.1 404 Not Found\r\n\r\n'); socket.destroy(); return; }
+  wss.handleUpgrade(req, socket, head, (ws) => attachSocket(pty, ws));
+});
+
+server.listen(PORT, () => {
+  console.log(`Claude Monitor → http://localhost:${PORT}`);
+  rehydrateFromTmux().catch((err) => console.error('rehydrate error:', err));
+});
+
+// Shutdown: detach from tmux locally; tmux sessions stay alive so claude
+// survives until explicitly killed via DELETE /pty/:id.
+function detachAllPtys() {
+  for (const pty of ptys.values()) { try { pty.proc.kill(); } catch {} }
+}
+process.on('SIGINT', () => { detachAllPtys(); process.exit(0); });
+process.on('SIGTERM', () => { detachAllPtys(); process.exit(0); });

@@ -2,12 +2,11 @@
 
 **English** | [한국어](./README.ko.md)
 
-> A tiny, local-only web UI that streams your active **Claude Code** CLI session in real time.
-> It just tails the JSONL session files Claude Code already writes — no CLI wrapping, no network calls.
+> A local web UI for **Claude Code**: observe any running session (by tailing JSONL) AND spawn new sessions with an attached in-browser terminal. Everything stays on `localhost`.
 
 ![hero](./docs/screenshots/hero.png)
 
-![status](https://img.shields.io/badge/status-experimental-orange) ![license](https://img.shields.io/badge/license-MIT-blue) ![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen) ![deps](https://img.shields.io/badge/runtime%20deps-0-success)
+![status](https://img.shields.io/badge/status-experimental-orange) ![license](https://img.shields.io/badge/license-MIT-blue) ![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)
 
 ---
 
