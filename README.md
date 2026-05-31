@@ -12,18 +12,43 @@
 
 ## ⚡ 30-second start
 
+### Windows
+
+```powershell
+# 1. Open this project folder
+cd C:\Users\user\Documents\claude-code-monitor
+
+# 2. Install dependencies once
+npm install
+
+# 3. Run
+.\start-windows.cmd
+```
+
+Open <http://localhost:7777>.
+
+If the app exits with `Not found: C:\Users\user\.claude\projects`, create that directory once:
+
+```powershell
+New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.claude\projects"
+```
+
+### macOS
+
 ```bash
 # 1. Clone
 git clone https://github.com/OreoChoi/claude-code-monitor.git ~/claude-code-monitor
+cd ~/claude-code-monitor
 
-# 2. Run
-node ~/claude-code-monitor/monitor.mjs
+# 2. Install dependencies once
+npm install
 
-# 3. Open in your browser
-open http://localhost:7777
+# 3. Run
+chmod +x ~/claude-code-monitor/*.command
+./start.command
 ```
 
-No `npm install` needed. On macOS you can also double-click `start.command`.
+Open <http://localhost:7777>. You can also double-click `start.command` in Finder.
 
 ---
 
@@ -38,7 +63,7 @@ No `npm install` needed. On macOS you can also double-click `start.command`.
 - **Structured AskUserQuestion rendering** — when Claude presents choices, the call expands into per-question cards (header chip, options, descriptions) instead of a JSON blob. Options ending in `(Recommended)` get a purple border.
 - **Live token counters** — input / output / cache_read / cache_create accumulated per session.
 - **i18n** — Korean / English (toggle in settings, persisted in localStorage).
-- **Zero dependencies** — single Node script using only standard modules.
+- **Local-first runtime** — one Node server plus browser-terminal dependencies (`ws`, `node-pty`, xterm).
 
 ---
 
@@ -54,25 +79,36 @@ More screens and how to use them → **[User Guide](./docs/GUIDE.md)**
 
 ## 📦 Install
 
-Three options:
+### Windows
 
-**A. Double-click (macOS)**
+```powershell
+npm install
+.\start-windows.cmd
+```
+
+Verify the server:
+
+```powershell
+(Invoke-WebRequest -UseBasicParsing http://localhost:7777).StatusCode
+```
+
+Expected result: `200`.
+
+### macOS
+
 ```bash
-git clone https://github.com/OreoChoi/claude-code-monitor.git ~/claude-code-monitor
+npm install
 chmod +x ~/claude-code-monitor/*.command
-# Double-click start.command in Finder
+./start.command
 ```
 
-**B. Terminal**
+Verify the server:
+
 ```bash
-node ~/claude-code-monitor/monitor.mjs
-# Ctrl-C to stop
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:7777
 ```
 
-**C. npx (no install)**
-```bash
-npx -y github:OreoChoi/claude-code-monitor
-```
+Expected result: `200`.
 
 Then open <http://localhost:7777> and use Claude Code normally — events stream in.
 
@@ -98,7 +134,8 @@ Everything is local. The server binds to `localhost:7777` only. No telemetry, no
 ## 📋 Requirements
 
 - Node.js 18+
-- macOS or Linux (`.command` launchers are macOS-only)
+- Windows or macOS (`.command` launchers are macOS-only)
+- npm for installing runtime dependencies
 - Claude Code CLI installed (so that `~/.claude/projects/` exists)
 
 ## 📝 License
