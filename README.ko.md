@@ -12,18 +12,43 @@
 
 ## ⚡ 30초 시작
 
+### Windows
+
+```powershell
+# 1. 프로젝트 폴더로 이동
+cd C:\Users\user\Documents\claude-code-monitor
+
+# 2. 최초 1회 의존성 설치
+npm install
+
+# 3. 실행
+.\start-windows.cmd
+```
+
+브라우저에서 <http://localhost:7777>을 엽니다.
+
+`Not found: C:\Users\user\.claude\projects`가 나오면 아래 디렉터리를 한 번 생성하세요.
+
+```powershell
+New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.claude\projects"
+```
+
+### macOS
+
 ```bash
 # 1. 클론
 git clone https://github.com/OreoChoi/claude-code-monitor.git ~/claude-code-monitor
+cd ~/claude-code-monitor
 
-# 2. 실행
-node ~/claude-code-monitor/monitor.mjs
+# 2. 최초 1회 의존성 설치
+npm install
 
-# 3. 브라우저에서 열기
-open http://localhost:7777
+# 3. 실행
+chmod +x ~/claude-code-monitor/*.command
+./start.command
 ```
 
-`npm install` 필요 없음. macOS면 `start.command` 더블클릭으로도 실행됩니다.
+브라우저에서 <http://localhost:7777>을 엽니다. Finder에서 `start.command`를 더블클릭해도 실행됩니다.
 
 ---
 
@@ -38,7 +63,7 @@ open http://localhost:7777
 - **AskUserQuestion 구조화 렌더링** — Claude가 선택지를 물을 때 JSON 덩어리 대신 질문·옵션 카드로 펼쳐 보여줍니다. `(Recommended)` 옵션은 보라 보더로 강조.
 - **실시간 토큰 카운터** — input / output / cache_read / cache_create 누적.
 - **다국어** — 한국어 / 영어 (설정에서 전환, 브라우저에 저장).
-- **무의존성** — Node 표준 모듈만 사용. `monitor.mjs` 단일 파일.
+- **로컬 우선 런타임** — Node 서버 하나와 브라우저 터미널 의존성(`ws`, `node-pty`, xterm)으로 동작.
 
 ---
 
@@ -54,25 +79,36 @@ open http://localhost:7777
 
 ## 📦 설치
 
-세 가지 방법 중 하나:
+### Windows
 
-**A. 더블클릭 (macOS)**
+```powershell
+npm install
+.\start-windows.cmd
+```
+
+서버 확인:
+
+```powershell
+(Invoke-WebRequest -UseBasicParsing http://localhost:7777).StatusCode
+```
+
+기대 결과: `200`
+
+### macOS
+
 ```bash
-git clone https://github.com/OreoChoi/claude-code-monitor.git ~/claude-code-monitor
+npm install
 chmod +x ~/claude-code-monitor/*.command
-# Finder에서 start.command 더블클릭
+./start.command
 ```
 
-**B. 터미널**
+서버 확인:
+
 ```bash
-node ~/claude-code-monitor/monitor.mjs
-# Ctrl-C로 종료
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:7777
 ```
 
-**C. npx (설치 없이)**
-```bash
-npx -y github:OreoChoi/claude-code-monitor
-```
+기대 결과: `200`
 
 브라우저에서 <http://localhost:7777> 열고, 평소처럼 Claude Code를 쓰면 이벤트가 흘러들어옵니다.
 
@@ -98,7 +134,8 @@ Claude Code는 모든 메시지·도구 호출·결과·토큰 사용량을 `~/.
 ## 📋 요구사항
 
 - Node.js 18+
-- macOS 또는 Linux (`.command` 런처는 macOS 전용)
+- Windows 또는 macOS (`.command` 런처는 macOS 전용)
+- npm 의존성 설치
 - Claude Code CLI 설치 (`~/.claude/projects/`가 존재해야 함)
 
 ## 📝 라이선스
